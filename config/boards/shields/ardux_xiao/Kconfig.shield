@@ -1,0 +1,2 @@
+config SHIELD_ARDUX_XIAO
+	def_bool $(shields_list_contains,ardux_xiao)

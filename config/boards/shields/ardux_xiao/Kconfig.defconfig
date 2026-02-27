@@ -1,0 +1,6 @@
+if SHIELD_ARDUX_XIAO
+
+config ZMK_KEYBOARD_NAME
+	default "ARDUX XIAO"
+
+endif
