@@ -1,2 +1,5 @@
-config SHIELD_ARDUX_XIAO
-	def_bool $(shields_list_contains,ardux_xiao)
+config SHIELD_ARDUX_XIAO_LEFT
+	def_bool $(shields_list_contains,ardux_xiao_left)
+
+config SHIELD_ARDUX_XIAO_RIGHT
+	def_bool $(shields_list_contains,ardux_xiao_right)
