@@ -11,66 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - board: nice_nano
-            shield: corne_ardux_left
-          - board: nice_nano
-            shield: corne_ardux_right
-          - board: nice_nano
-            shield: the_paintbrush_left
-          - board: nice_nano
-            shield: the_paintbrush_right
-          - board: nice_nano_v2
-            shield: the_paintbrush_left
-          - board: nice_nano_v2
-            shield: the_paintbrush_right
-          - board: bluemicro840_v1
-            shield: the_paintbrush_left
-          - board: bluemicro840_v1
-            shield: the_paintbrush_right
-          - board: nrfmicro_13
-            shield: the_paintbrush_left
-          - board: nrfmicro_13
-            shield: the_paintbrush_right
-          - board: nrfmicro_11
-            shield: the_paintbrush_left
-          - board: nrfmicro_11
-            shield: the_paintbrush_right
-          - board: nice_nano
-            shield: artboard_left
-          - board: nice_nano
-            shield: artboard_right
-          - board: nice_nano
-            shield: corne_5_col_ardux_left
-          - board: nice_nano
-            shield: corne_5_col_ardux_right
-          - board: nice_nano
-            shield: corne_5_col_ardux_left_big
-          - board: nice_nano
-            shield: corne_5_col_ardux_right_big
-          - board: nice_nano_v2
-            shield: corne_5_col_ardux_left_big
-          - board: nice_nano_v2
-            shield: corne_5_col_ardux_right_big
-          - board: bluemicro840_v1
-            shield: bluehand_left
-          - board: bluemicro840_v1
-            shield: bluehand_right
-          - board: nice_nano
-            shield: tidbit_ardux_left
-          - board: nice_nano
-            shield: tidbit_ardux_right
-          - board: nice_nano_v2
-            shield: cradio_ardux_left
-          - board: nice_nano_v2
-            shield: cradio_ardux_thumb_left
-          - board: nice_nano_v2
-            shield: cradio_ardux_right
-          - board: nice_nano_v2
-            shield: cradio_ardux_thumb_right
           - board: seeeduino_xiao_ble
             shield: ardux_xiao_left
-          - board: seeeduino_xiao_ble
-            shield: ardux_xiao_right
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,8 +58,34 @@ jobs:
       - name: ARDUX implementation dtsi file
         if: always()
         run: cat -n config/ardux.dtsi
+      - name: Show generated DTS (I2S + WS2812 + pinctrl sections)
+        if: always()
+        run: |
+          echo "=== FULL GENERATED DTS ==="
+          cat build/zephyr/zephyr.dts
+          echo ""
+          echo "=== I2S SECTIONS ==="
+          grep -n -A 20 'i2s' build/zephyr/zephyr.dts || echo "NO I2S FOUND IN DTS"
+          echo ""
+          echo "=== WS2812 SECTIONS ==="
+          grep -n -A 20 'ws2812\|led.strip\|led_strip' build/zephyr/zephyr.dts || echo "NO WS2812 FOUND IN DTS"
+          echo ""
+          echo "=== PINCTRL SECTIONS ==="
+          grep -n -A 10 'i2s0_default\|I2S_SDOUT\|pin = ' build/zephyr/zephyr.dts || echo "NO I2S PINCTRL FOUND"
+      - name: Show Kconfig (I2S + WS2812 + SPI + LED)
+        if: always()
+        run: |
+          echo "=== KEY CONFIG OPTIONS ==="
+          grep -E 'CONFIG_(I2S|WS2812|SPI|LED_STRIP|NRFX_I2S)' build/zephyr/.config || echo "NO MATCHING CONFIG FOUND"
+      - name: List build output files
+        if: always()
+        run: ls -la build/zephyr/zephyr.dts build/zephyr/.config build/zephyr/zmk.uf2 build/zephyr/zmk.hex 2>&1
       - name: Prep artifact (ardux.dtsi)
         run: cp config/ardux.dtsi ./ardux.dtsi
+      - name: Prep artifact (generated DTS)
+        run: cp build/zephyr/zephyr.dts ./zephyr.dts
+      - name: Prep artifact (build config)
+        run: cp build/zephyr/.config ./dot-config.txt
       - name: Prep artifact (${{ matrix.shield }}-${{ matrix.board }}-zmk-ardux.hex)
         run: cp build/zephyr/zmk.hex ${{ matrix.shield }}-${{ matrix.board }}-zmk-ardux.hex
       - name: Prep artifact (${{ matrix.shield }}-${{ matrix.board }}-zmk-ardux.uf2)
@@ -128,7 +96,8 @@ jobs:
           name: '${{ steps.variables.outputs.artifact-name }}'
           path: |
             ardux.dtsi
-            ${{ matrix.shield }}-${{ matrix.board }}.dts.pre.tmp
+            zephyr.dts
+            dot-config.txt
             ${{ matrix.shield }}-${{ matrix.board }}-zmk-ardux.hex
             ${{ matrix.shield }}-${{ matrix.board }}-zmk-ardux.uf2
         continue-on-error: true
