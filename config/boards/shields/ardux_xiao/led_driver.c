@@ -1,30 +1,56 @@
 /*
- * LED DIAGNOSTIC MODE — EXHAUSTIVE
+ * LED DIAGNOSTIC MODE — SPI + PIN IDENTITY
  *
  * Loops forever through tests on boot. Never enters normal mode.
  *
- * Onboard LED announces each test:
- *   RED blinks    = Group 1: Pin & hardware checks
- *   GREEN blinks  = Group 2: Basic strip colors
- *   BLUE blinks   = Group 3: Patterns & single LEDs
- *   WHITE blinks  = Group 4: Edge cases & inversion
- *   MAGENTA blinks= Group 5: Chain length & timing
- *   CYAN blinks   = Group 6: Color mapping
+ * ===== HOW TO USE =====
  *
- * Blink count = test number within group.
+ * Multimeter on DC voltage. Probe the XIAO pads as indicated.
  *
- * WATCH FOR:
- *   - Multimeter on D9 during pin tests (Group 1)
- *   - Any LED strip illumination during any test
- *   - If strip lights on "ALL OFF" test = signal inverted
- *   - If only short-chain tests work = buffer/timing issue
+ * GROUP 1 — PIN IDENTITY (onboard = RED, blinks 1/2/3)
+ *   Toggles D8, D9, D10 as raw GPIO.
+ *   1 blink=D8, 2=D9, 3=D10. ~1kHz square wave for 3s each.
+ *   Multimeter should read ~1.6V on the toggling pad.
+ *
+ * GROUP 2 — RAW SPI (onboard = YELLOW, blinks 1-7)
+ *   Bypasses the WS2812 driver entirely. Calls spi_write() directly
+ *   on &spi3 with manually constructed spi_config. Tests:
+ *   2.1: SPI3 device readiness
+ *   2.2: Raw 0xFF bytes (all ones — MOSI should be HIGH the whole time)
+ *   2.3: Raw 0xAA bytes (alternating — MOSI toggles, multimeter ~1.6V)
+ *   2.4: Raw 0x00 bytes (all zeros — MOSI stays LOW)
+ *   2.5: SPI mode 1 (CPHA=1)
+ *   2.6: SPI mode 2 (CPOL=1)
+ *   2.7: SPI mode 3 (CPOL=1, CPHA=1)
+ *   If D9 shows voltage during 2.2/2.3 but not 2.4 → SPI3 works!
+ *   If D9 shows nothing on any test → SPI3 is NOT driving the pin.
+ *
+ * GROUP 3 — RAW WS2812 FRAME (onboard = CYAN, blinks 1-3)
+ *   Manually encodes WS2812 pixel data using one_frame/zero_frame
+ *   and sends via raw spi_write(). Bypasses ws2812 driver but uses
+ *   the same encoding. Tests if our manual encoding lights the strip.
+ *   3.1: 1 LED all-white (GRB = 0xFF,0xFF,0xFF)
+ *   3.2: 1 LED all-white, 10x rapid sends (in case first frame drops)
+ *   3.3: 1 LED, different one/zero frame values (0x7C/0x60 — wider pulses)
+ *
+ * GROUP 4 — WS2812 DRIVER STRIP TESTS (onboard = GREEN, blinks 1-6)
+ *   Uses led_strip_update_rgb() through the WS2812 SPI driver.
+ *   Standard color tests: white, red, green, blue, multi-send, reset.
+ *
+ * GROUP 5 — PATTERNS (onboard = BLUE, blinks 1-4)
+ *   Walking LED, first LED, RGB cycle, all-off inversion check.
+ *
+ * GROUP 6 — CHAIN LENGTH (onboard = MAGENTA, blinks 1-5)
+ *   chain=1, 2, 3, 8, 13.
+ *
+ * After all groups: rapid cyan blink = cycle complete, restarting.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/i2s.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
 
@@ -32,6 +58,7 @@ LOG_MODULE_REGISTER(led_diag, 4);
 
 #define TOTAL_LEDS 13
 #define TEST_HOLD_MS 3000
+#define PIN_TOGGLE_MS 3000
 
 static struct led_rgb pixels[TOTAL_LEDS];
 static const struct device *strip;
@@ -77,7 +104,7 @@ static void onboard_blink(int r, int g, int b, int count, int ms) {
 }
 
 /* ============================================================
- * Strip helpers
+ * Strip helpers (for WS2812 driver tests)
  * ============================================================ */
 
 static void strip_clear(void) { memset(pixels, 0, sizeof(pixels)); }
@@ -106,6 +133,7 @@ static int strip_send_n(int n) {
     return rc;
 }
 
+/* Announce a test */
 static void announce(int r, int g, int b, int num) {
     LOG_INF("──────────────────────────────────");
     onboard_off();
@@ -116,9 +144,7 @@ static void announce(int r, int g, int b, int num) {
 }
 
 /* ============================================================
- * GPIO pin toggle test — toggles a pin as raw GPIO output
- * so you can probe with multimeter. Toggles for ~2 seconds.
- * Returns 0 if gpio_pin_configure succeeded, negative on error.
+ * GPIO pin toggle test
  * ============================================================ */
 
 static int test_gpio_toggle(const struct device *port, gpio_pin_t pin,
@@ -128,22 +154,96 @@ static int test_gpio_toggle(const struct device *port, gpio_pin_t pin,
         LOG_ERR("GPIO config %s (pin %d): FAILED rc=%d", label, pin, rc);
         return rc;
     }
-    LOG_INF("GPIO toggle %s (pin %d): toggling for %d ms", label, pin, duration_ms);
+    LOG_INF("GPIO toggle %s (pin %d): toggling for %d ms",
+            label, pin, duration_ms);
 
     int64_t end = k_uptime_get() + duration_ms;
     int cycles = 0;
     while (k_uptime_get() < end) {
         gpio_pin_set(port, pin, 1);
-        k_busy_wait(500);  /* 500us high */
+        k_busy_wait(500);
         gpio_pin_set(port, pin, 0);
-        k_busy_wait(500);  /* 500us low */
+        k_busy_wait(500);
         cycles++;
     }
     LOG_INF("GPIO toggle %s: %d cycles completed", label, cycles);
-
-    /* Leave pin LOW */
     gpio_pin_set(port, pin, 0);
     return 0;
+}
+
+/* ============================================================
+ * Pin table: D8, D9, D10 only
+ * ============================================================ */
+
+struct test_pin {
+    const struct device **port;
+    gpio_pin_t pin;
+    const char *label;
+    int announce_count;
+};
+
+#define SPI_PIN_COUNT 3
+static struct test_pin spi_pins[SPI_PIN_COUNT];
+
+static void init_pin_table(void) {
+    spi_pins[0] = (struct test_pin){ &gpio1, 13, "D8/P1.13",  1 };
+    spi_pins[1] = (struct test_pin){ &gpio1, 14, "D9/P1.14",  2 };
+    spi_pins[2] = (struct test_pin){ &gpio1, 15, "D10/P1.15", 3 };
+}
+
+/* ============================================================
+ * Raw SPI helpers
+ *
+ * Send arbitrary bytes directly on &spi3, bypassing the WS2812
+ * driver. This tests whether the SPI peripheral is actually
+ * clocking data out on the MOSI pin (D9/P1.14).
+ * ============================================================ */
+
+/* Buffer for raw SPI tests — big enough for 1 LED of WS2812 data
+ * (3 colors * 8 SPI bytes per color = 24 bytes) plus some extra */
+#define RAW_SPI_BUF_SIZE 64
+static uint8_t raw_spi_buf[RAW_SPI_BUF_SIZE];
+
+/*
+ * Send raw bytes on SPI3 with given operation flags.
+ * Returns the spi_write() return code.
+ */
+static int raw_spi_send(const struct device *spi_dev, uint16_t operation,
+                        uint8_t *buf, size_t len, const char *desc) {
+    struct spi_config cfg = {
+        .frequency = 4000000,  /* 4 MHz — same as overlay */
+        .operation = operation,
+        .slave = 0,
+        .cs = { .gpio = { .port = NULL }, .delay = 0 },
+    };
+
+    struct spi_buf spi_buf = { .buf = buf, .len = len };
+    struct spi_buf_set tx = { .buffers = &spi_buf, .count = 1 };
+
+    int rc = spi_write(spi_dev, &cfg, &tx);
+    LOG_INF("  raw_spi_send(%s): len=%d rc=%d", desc, (int)len, rc);
+    return rc;
+}
+
+/* Standard SPI operation: mode 0, 8-bit, MSB first (matches WS2812 driver) */
+#define SPI_OP_MODE0  (SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB | SPI_WORD_SET(8))
+/* Mode 1: CPHA=1 */
+#define SPI_OP_MODE1  (SPI_OP_MODE0 | SPI_MODE_CPHA)
+/* Mode 2: CPOL=1 */
+#define SPI_OP_MODE2  (SPI_OP_MODE0 | SPI_MODE_CPOL)
+/* Mode 3: CPOL=1, CPHA=1 */
+#define SPI_OP_MODE3  (SPI_OP_MODE0 | SPI_MODE_CPOL | SPI_MODE_CPHA)
+
+/*
+ * Manually encode a single WS2812 color byte into 8 SPI bytes,
+ * using the given one_frame and zero_frame values.
+ * Same algorithm as ws2812_spi.c ws2812_spi_ser().
+ */
+static void encode_ws2812_byte(uint8_t *out, uint8_t color,
+                               uint8_t one_frame, uint8_t zero_frame) {
+    for (int i = 0; i < 8; i++) {
+        out[i] = (color & (0x80 >> i)) ? one_frame : zero_frame;
+    }
 }
 
 /* ============================================================
@@ -152,151 +252,291 @@ static int test_gpio_toggle(const struct device *port, gpio_pin_t pin,
 
 static void run_diagnostics(void) {
     int rc;
+    const struct device *spi3_dev = NULL;
+
+    /* Get SPI3 device for raw SPI tests */
+#if DT_NODE_EXISTS(DT_NODELABEL(spi3))
+    spi3_dev = DEVICE_DT_GET(DT_NODELABEL(spi3));
+#endif
 
     /* ================================================================
-     * GROUP 1: PIN & HARDWARE CHECKS (onboard = RED)
+     * GROUP 1: PIN IDENTITY TEST (onboard = RED)
      *
-     * Use multimeter on D8 (P1.13), D9 (P1.14), D10 (P1.15)
-     * Expected: ~1.6V average during toggle (rapid square wave)
-     * Then ~0V when done.
+     * Blink count: 1=D8, 2=D9, 3=D10.
      * ================================================================ */
 
-    /* Test 1.1: Toggle D9 (P1.14) as raw GPIO — BEFORE I2S touches it
-     * This proves: can the MCU physically drive this pin?
-     * Measure D9 with multimeter — should see ~1.6V during this test.
-     * If you see 3.5V (floating), the pin is not being driven. */
-    announce(1, 0, 0, 1);
-    LOG_INF("T1.1: GPIO toggle D9/P1.14 — measure with multimeter!");
-    rc = test_gpio_toggle(gpio1, 14, 3000, "D9/P1.14");
-    LOG_INF("T1.1: result=%d (0=OK)", rc);
-    k_msleep(500);
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 1: PIN IDENTITY (probe D8/D9/D10 with multimeter)");
+    LOG_INF("════════════════════════════════════");
 
-    /* Test 1.2: Toggle D8 (P1.13) as raw GPIO
-     * Verifies pin mapping — probe D8 pad with multimeter */
-    announce(1, 0, 0, 2);
-    LOG_INF("T1.2: GPIO toggle D8/P1.13");
-    rc = test_gpio_toggle(gpio1, 13, 2000, "D8/P1.13");
-    LOG_INF("T1.2: result=%d", rc);
-    k_msleep(500);
+    for (int i = 0; i < SPI_PIN_COUNT; i++) {
+        struct test_pin *p = &spi_pins[i];
+        announce(1, 0, 0, p->announce_count);
 
-    /* Test 1.3: Toggle D10 (P1.15) as raw GPIO */
-    announce(1, 0, 0, 3);
-    LOG_INF("T1.3: GPIO toggle D10/P1.15");
-    rc = test_gpio_toggle(gpio1, 15, 2000, "D10/P1.15");
-    LOG_INF("T1.3: result=%d", rc);
-    k_msleep(500);
+        LOG_INF("T1.%d: GPIO toggle %s — probe pad now!", i + 1, p->label);
+        rc = test_gpio_toggle(*(p->port), p->pin, PIN_TOGGLE_MS, p->label);
 
-    /* Test 1.4: Check DT node existence and strip device readiness */
-    announce(1, 0, 0, 4);
-    LOG_INF("T1.4: Device tree & driver check");
-#if DT_NODE_EXISTS(DT_NODELABEL(led_strip))
-    LOG_INF("  DT node 'led_strip': EXISTS");
-#else
-    LOG_ERR("  DT node 'led_strip': MISSING — overlay not applied!");
-#endif
-#if DT_NODE_EXISTS(DT_NODELABEL(i2s_led))
-    LOG_INF("  DT node 'i2s_led': EXISTS");
-#else
-    LOG_ERR("  DT node 'i2s_led': MISSING");
-#endif
-#if DT_NODE_EXISTS(DT_NODELABEL(i2s0))
-    LOG_INF("  DT node 'i2s0': EXISTS");
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(i2s0), okay)
-    LOG_INF("  DT node 'i2s0': status=okay");
-#else
-    LOG_ERR("  DT node 'i2s0': status != okay!");
-#endif
-#else
-    LOG_ERR("  DT node 'i2s0': MISSING");
-#endif
-    LOG_INF("  strip device_is_ready: %s", device_is_ready(strip) ? "YES" : "NO");
-    LOG_INF("  strip device name: %s", strip ? strip->name : "(null)");
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 1.5: Try to reconfigure P1.14 as GPIO AFTER I2S init.
-     * If I2S properly claimed the pin, this might fail or conflict. */
-    announce(1, 0, 0, 5);
-    LOG_INF("T1.5: GPIO on P1.14 AFTER I2S init (conflict test)");
-    rc = gpio_pin_configure(gpio1, 14, GPIO_OUTPUT);
-    LOG_INF("  gpio_pin_configure returned: %d (0=success, neg=I2S may have claimed it)", rc);
-    if (rc == 0) {
-        LOG_WRN("  Pin NOT claimed by I2S! This means I2S is NOT driving D9.");
-        /* Toggle it to show it's driveable as GPIO even now */
-        for (int i = 0; i < 2000; i++) {
-            gpio_pin_set(gpio1, 14, 1);
-            k_busy_wait(500);
-            gpio_pin_set(gpio1, 14, 0);
-            k_busy_wait(500);
+        if (rc == 0) {
+            LOG_INF("  T1.%d: OK — pin toggled as GPIO", i + 1);
+            if (i == 1) {
+                LOG_WRN("  D9/P1.14 NOT claimed by SPI3!");
+            }
+        } else {
+            LOG_WRN("  T1.%d: FAILED rc=%d — pin claimed by peripheral", i + 1, rc);
+            if (i == 1) {
+                LOG_INF("  D9/P1.14 claimed by SPI3 — good.");
+            }
         }
-    } else {
-        LOG_INF("  Pin claimed by I2S — good, I2S peripheral owns the pin.");
+        onboard_off();
+        k_msleep(500);
     }
-    k_msleep(TEST_HOLD_MS);
 
-    /* Test 1.6: High drive strength on P1.14
-     * nRF52840 defaults to standard drive. DS_ALT flag requests high drive.
-     * More current = better chance of reaching WS2812 VIH threshold at 5V. */
-    announce(1, 0, 0, 6);
-    LOG_INF("T1.6: GPIO toggle P1.14 with high drive strength");
-    /* Try with drive-strength-related extra flags. On nRF, the pinctrl
-     * driver handles drive strength, but we can at least toggle fast. */
-    rc = gpio_pin_configure(gpio1, 14, GPIO_OUTPUT);
-    if (rc == 0) {
-        LOG_INF("  Toggling D9 for 2s (fast square wave)");
-        int64_t end = k_uptime_get() + 2000;
-        while (k_uptime_get() < end) {
-            gpio_pin_set(gpio1, 14, 1);
-            k_busy_wait(100);  /* 100us per half = 5kHz — visible on scope */
-            gpio_pin_set(gpio1, 14, 0);
-            k_busy_wait(100);
-        }
-        gpio_pin_set(gpio1, 14, 0);
-    } else {
-        LOG_ERR("  GPIO config failed: %d", rc);
-    }
-    k_msleep(1000);
+    LOG_INF("────────────────────────────────────");
+    LOG_INF("PIN IDENTITY: 1 blink=D8, 2 blinks=D9, 3 blinks=D10");
+    LOG_INF("────────────────────────────────────");
+    k_msleep(2000);
 
     /* ================================================================
-     * GROUP 2: BASIC STRIP COLORS (onboard = GREEN)
+     * GROUP 2: RAW SPI TESTS (onboard = YELLOW)
      *
-     * If none of these light the strip, it's not a color/data issue.
+     * Bypasses WS2812 driver entirely. Sends raw bytes on SPI3.
+     * Probe D9 with multimeter during each test.
+     *
+     * If D9 shows voltage on 0xFF / 0xAA tests but not 0x00 → SPI works.
+     * If D9 shows nothing → SPI3 is not driving the MOSI pin at all.
      * ================================================================ */
 
-    /* Test 2.1: All WHITE max brightness */
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 2: RAW SPI (bypass WS2812 driver)");
+    LOG_INF("════════════════════════════════════");
+
+    /* Test 2.1: SPI3 device check */
+    announce(1, 1, 0, 1);  /* yellow = red+green */
+    LOG_INF("T2.1: SPI3 device check");
+    if (spi3_dev == NULL) {
+        LOG_ERR("  SPI3 device: NOT FOUND in device tree!");
+        LOG_ERR("  Cannot run raw SPI tests.");
+        k_msleep(TEST_HOLD_MS);
+    } else {
+        LOG_INF("  SPI3 device: name='%s'", spi3_dev->name);
+        LOG_INF("  SPI3 ready: %s", device_is_ready(spi3_dev) ? "YES" : "NO");
+        if (!device_is_ready(spi3_dev)) {
+            LOG_ERR("  SPI3 NOT READY — raw SPI tests will likely fail");
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.2: Raw 0xFF — all ones, MOSI should be HIGH entire transfer.
+         * With 64 bytes at 4MHz, transfer lasts ~128us.
+         * Multimeter might just barely catch it. Sending 10x with gaps. */
+        announce(1, 1, 0, 2);
+        LOG_INF("T2.2: Raw SPI 0xFF x64 bytes, 10 sends, mode 0");
+        LOG_INF("  Probe D9 — should see brief voltage if SPI drives MOSI");
+        memset(raw_spi_buf, 0xFF, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0xFF mode0");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.3: Raw 0xAA — alternating bits, MOSI toggles.
+         * Multimeter should read ~1.6V average. */
+        announce(1, 1, 0, 3);
+        LOG_INF("T2.3: Raw SPI 0xAA x64 bytes, 10 sends, mode 0");
+        LOG_INF("  Probe D9 — alternating pattern, ~1.6V avg");
+        memset(raw_spi_buf, 0xAA, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0xAA mode0");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.4: Raw 0x00 — all zeros, MOSI should stay LOW.
+         * If multimeter shows voltage here → signal is inverted! */
+        announce(1, 1, 0, 4);
+        LOG_INF("T2.4: Raw SPI 0x00 x64 bytes, mode 0");
+        LOG_INF("  Probe D9 — should see ~0V (MOSI LOW)");
+        LOG_INF("  ** IF voltage here → SIGNAL INVERTED **");
+        memset(raw_spi_buf, 0x00, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0x00 mode0");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.5: Mode 1 (CPHA=1) — same 0xAA data */
+        announce(1, 1, 0, 5);
+        LOG_INF("T2.5: Raw SPI 0xAA, MODE 1 (CPHA=1)");
+        memset(raw_spi_buf, 0xAA, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE1, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0xAA mode1");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.6: Mode 2 (CPOL=1) — same 0xAA data */
+        announce(1, 1, 0, 6);
+        LOG_INF("T2.6: Raw SPI 0xAA, MODE 2 (CPOL=1)");
+        memset(raw_spi_buf, 0xAA, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE2, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0xAA mode2");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 2.7: Mode 3 (CPOL=1, CPHA=1) — same 0xAA data */
+        announce(1, 1, 0, 7);
+        LOG_INF("T2.7: Raw SPI 0xAA, MODE 3 (CPOL=1,CPHA=1)");
+        memset(raw_spi_buf, 0xAA, RAW_SPI_BUF_SIZE);
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE3, raw_spi_buf,
+                              RAW_SPI_BUF_SIZE, "0xAA mode3");
+            k_msleep(50);
+        }
+        k_msleep(TEST_HOLD_MS);
+    }
+
+    /* ================================================================
+     * GROUP 3: RAW WS2812 FRAME (onboard = CYAN)
+     *
+     * Manually encodes WS2812 pixel data into SPI bytes using
+     * the same algorithm as the WS2812 driver, then sends via
+     * raw spi_write(). This isolates "is the encoding wrong?"
+     * from "is SPI working at all?"
+     *
+     * One RGB LED = 3 colors * 8 SPI bytes = 24 bytes.
+     * GRB order (matching our overlay color-mapping).
+     * ================================================================ */
+
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 3: RAW WS2812 FRAME (manual encoding)");
+    LOG_INF("════════════════════════════════════");
+
+    if (spi3_dev != NULL && device_is_ready(spi3_dev)) {
+
+        /* Test 3.1: 1 LED, all white, standard frames (0x70/0x40) */
+        announce(0, 1, 1, 1);  /* cyan */
+        LOG_INF("T3.1: Manual WS2812 frame: 1 LED WHITE (GRB=FF,FF,FF)");
+        LOG_INF("  one_frame=0x70 zero_frame=0x40 (standard)");
+        memset(raw_spi_buf, 0, RAW_SPI_BUF_SIZE);
+        encode_ws2812_byte(&raw_spi_buf[0],  0xFF, 0x70, 0x40);  /* G */
+        encode_ws2812_byte(&raw_spi_buf[8],  0xFF, 0x70, 0x40);  /* R */
+        encode_ws2812_byte(&raw_spi_buf[16], 0xFF, 0x70, 0x40);  /* B */
+        raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf, 24,
+                     "1LED white 0x70/0x40");
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 3.2: Same as 3.1 but 10x rapid sends */
+        announce(0, 1, 1, 2);
+        LOG_INF("T3.2: Same frame 10x rapid sends (100ms apart)");
+        for (int i = 0; i < 10; i++) {
+            rc = raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf, 24,
+                              "1LED white repeat");
+            k_msleep(100);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 3.3: Different one/zero frame values.
+         * 0x7C = 01111100 = wider "one" pulse (5/8 of byte period)
+         * 0x60 = 01100000 = wider "zero" pulse (2/8 of byte period)
+         * Some strips need different timing. */
+        announce(0, 1, 1, 3);
+        LOG_INF("T3.3: Manual WS2812: 1 LED WHITE, alt frames 0x7C/0x60");
+        memset(raw_spi_buf, 0, RAW_SPI_BUF_SIZE);
+        encode_ws2812_byte(&raw_spi_buf[0],  0xFF, 0x7C, 0x60);  /* G */
+        encode_ws2812_byte(&raw_spi_buf[8],  0xFF, 0x7C, 0x60);  /* R */
+        encode_ws2812_byte(&raw_spi_buf[16], 0xFF, 0x7C, 0x60);  /* B */
+        for (int i = 0; i < 5; i++) {
+            raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf, 24,
+                         "1LED white 0x7C/0x60");
+            k_msleep(100);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 3.4: Different one/zero frame values — even wider.
+         * 0x7E = 01111110 = 6/8 one pulse
+         * 0x40 = 01000000 = 1/8 zero pulse
+         * This produces very different timing from standard. */
+        announce(0, 1, 1, 4);
+        LOG_INF("T3.4: Manual WS2812: 1 LED WHITE, alt frames 0x7E/0x40");
+        memset(raw_spi_buf, 0, RAW_SPI_BUF_SIZE);
+        encode_ws2812_byte(&raw_spi_buf[0],  0xFF, 0x7E, 0x40);  /* G */
+        encode_ws2812_byte(&raw_spi_buf[8],  0xFF, 0x7E, 0x40);  /* R */
+        encode_ws2812_byte(&raw_spi_buf[16], 0xFF, 0x7E, 0x40);  /* B */
+        for (int i = 0; i < 5; i++) {
+            raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf, 24,
+                         "1LED white 0x7E/0x40");
+            k_msleep(100);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+        /* Test 3.5: 1 LED RED only (G=0, R=FF, B=0) — simpler pattern,
+         * fewer "one" pulses in the data stream */
+        announce(0, 1, 1, 5);
+        LOG_INF("T3.5: Manual WS2812: 1 LED RED (GRB=00,FF,00)");
+        memset(raw_spi_buf, 0, RAW_SPI_BUF_SIZE);
+        encode_ws2812_byte(&raw_spi_buf[0],  0x00, 0x70, 0x40);  /* G=0 */
+        encode_ws2812_byte(&raw_spi_buf[8],  0xFF, 0x70, 0x40);  /* R=FF */
+        encode_ws2812_byte(&raw_spi_buf[16], 0x00, 0x70, 0x40);  /* B=0 */
+        for (int i = 0; i < 5; i++) {
+            raw_spi_send(spi3_dev, SPI_OP_MODE0, raw_spi_buf, 24,
+                         "1LED red 0x70/0x40");
+            k_msleep(100);
+        }
+        k_msleep(TEST_HOLD_MS);
+
+    } else {
+        LOG_ERR("GROUP 3: Skipped — SPI3 device not available");
+        k_msleep(2000);
+    }
+
+    /* ================================================================
+     * GROUP 4: WS2812 DRIVER STRIP TESTS (onboard = GREEN)
+     * ================================================================ */
+
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 4: WS2812 DRIVER STRIP COLORS");
+    LOG_INF("════════════════════════════════════");
+
+    /* Test 4.1: All WHITE */
     announce(0, 1, 0, 1);
-    LOG_INF("T2.1: All WHITE (255,255,255)");
+    LOG_INF("T4.1: All WHITE (255,255,255) — 13 LEDs");
     strip_fill(255, 255, 255);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 2.2: All RED */
+    /* Test 4.2: All RED */
     announce(0, 1, 0, 2);
-    LOG_INF("T2.2: All RED (255,0,0)");
+    LOG_INF("T4.2: All RED (255,0,0)");
     strip_fill(255, 0, 0);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 2.3: All GREEN */
+    /* Test 4.3: All GREEN */
     announce(0, 1, 0, 3);
-    LOG_INF("T2.3: All GREEN (0,255,0)");
+    LOG_INF("T4.3: All GREEN (0,255,0)");
     strip_fill(0, 255, 0);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 2.4: All BLUE */
+    /* Test 4.4: All BLUE */
     announce(0, 1, 0, 4);
-    LOG_INF("T2.4: All BLUE (0,0,255)");
+    LOG_INF("T4.4: All BLUE (0,0,255)");
     strip_fill(0, 0, 255);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 2.5: Multiple consecutive sends — some strips drop first frame */
+    /* Test 4.5: 5x consecutive sends */
     announce(0, 1, 0, 5);
-    LOG_INF("T2.5: 5x consecutive sends, all WHITE, 100ms apart");
+    LOG_INF("T4.5: 5x consecutive sends, all WHITE, 100ms apart");
     strip_fill(255, 255, 255);
     for (int i = 0; i < 5; i++) {
         rc = strip_send();
@@ -305,22 +545,27 @@ static void run_diagnostics(void) {
     }
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 2.6: Send with long reset delay between frames */
+    /* Test 4.6: Reset timing test */
     announce(0, 1, 0, 6);
-    LOG_INF("T2.6: Send WHITE, wait 1s, send WHITE again (long reset)");
-    strip_fill(255, 255, 255);
+    LOG_INF("T4.6: Send OFF, wait 1s (reset), then WHITE");
+    strip_fill(0, 0, 0);
     strip_send();
-    k_msleep(1000);  /* Long reset */
+    k_msleep(1000);
+    strip_fill(255, 255, 255);
     strip_send();
     k_msleep(TEST_HOLD_MS);
 
     /* ================================================================
-     * GROUP 3: PATTERNS & SINGLE LEDS (onboard = BLUE)
+     * GROUP 5: PATTERNS (onboard = BLUE)
      * ================================================================ */
 
-    /* Test 3.1: Walking LED through all positions */
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 5: PATTERNS");
+    LOG_INF("════════════════════════════════════");
+
+    /* Test 5.1: Walking LED */
     announce(0, 0, 1, 1);
-    LOG_INF("T3.1: Walking LED (single white, all positions)");
+    LOG_INF("T5.1: Walking LED (single white, all 13 positions)");
     for (int i = 0; i < TOTAL_LEDS; i++) {
         strip_clear();
         strip_set(i, 255, 255, 255);
@@ -329,27 +574,18 @@ static void run_diagnostics(void) {
     }
     k_msleep(500);
 
-    /* Test 3.2: First LED only */
+    /* Test 5.2: First LED only */
     announce(0, 0, 1, 2);
-    LOG_INF("T3.2: LED[0] only = WHITE");
+    LOG_INF("T5.2: LED[0] only = WHITE");
     strip_clear();
     strip_set(0, 255, 255, 255);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 3.3: Last LED only */
+    /* Test 5.3: R/G/B cycling */
     announce(0, 0, 1, 3);
-    LOG_INF("T3.3: LED[%d] only = WHITE", TOTAL_LEDS - 1);
-    strip_clear();
-    strip_set(TOTAL_LEDS - 1, 255, 255, 255);
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 3.4: All LEDs different — R, G, B cycling */
-    announce(0, 0, 1, 4);
-    LOG_INF("T3.4: Each LED different color (R/G/B cycle)");
+    LOG_INF("T5.3: Each LED different (R/G/B cycle)");
     strip_clear();
     for (int i = 0; i < TOTAL_LEDS; i++) {
         switch (i % 3) {
@@ -362,62 +598,32 @@ static void run_diagnostics(void) {
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* ================================================================
-     * GROUP 4: EDGE CASES & INVERSION (onboard = WHITE)
-     * ================================================================ */
-
-    /* Test 4.1: ALL OFF — if strip lights here, signal is INVERTED */
-    announce(1, 1, 1, 1);
-    LOG_INF("T4.1: All OFF (0,0,0) — ** IF LIT = INVERTED SIGNAL **");
+    /* Test 5.4: ALL OFF — inversion check */
+    announce(0, 0, 1, 4);
+    LOG_INF("T5.4: All OFF (0,0,0) — ** IF LIT = INVERTED SIGNAL **");
     strip_fill(0, 0, 0);
     rc = strip_send();
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 4.2: Dim white (1,1,1) — minimum non-zero */
-    announce(1, 1, 1, 2);
-    LOG_INF("T4.2: Dim white (1,1,1)");
-    strip_fill(1, 1, 1);
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 4.3: Medium brightness (128,128,128) */
-    announce(1, 1, 1, 3);
-    LOG_INF("T4.3: Medium white (128,128,128)");
-    strip_fill(128, 128, 128);
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 4.4: Brightness ramp — LEDs go from 0 to 255 across the strip */
-    announce(1, 1, 1, 4);
-    LOG_INF("T4.4: Brightness ramp (0 to 255 across strip)");
-    strip_clear();
-    for (int i = 0; i < TOTAL_LEDS; i++) {
-        uint8_t v = (uint8_t)((i * 255) / (TOTAL_LEDS - 1));
-        strip_set(i, v, v, v);
-    }
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
     /* ================================================================
-     * GROUP 5: CHAIN LENGTH & TIMING (onboard = MAGENTA)
+     * GROUP 6: CHAIN LENGTH (onboard = MAGENTA)
      * ================================================================ */
 
-    /* Test 5.1: chain=1, just LED[0] white */
+    LOG_INF("════════════════════════════════════");
+    LOG_INF("  GROUP 6: CHAIN LENGTH TESTS");
+    LOG_INF("════════════════════════════════════");
+
     announce(1, 0, 1, 1);
-    LOG_INF("T5.1: chain=1, LED[0]=WHITE");
+    LOG_INF("T6.1: chain=1, LED[0]=WHITE");
     strip_clear();
     strip_set(0, 255, 255, 255);
     rc = strip_send_n(1);
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 5.2: chain=2 */
     announce(1, 0, 1, 2);
-    LOG_INF("T5.2: chain=2, LED[0..1]=WHITE");
+    LOG_INF("T6.2: chain=2, LED[0..1]=WHITE");
     strip_clear();
     strip_set(0, 255, 255, 255);
     strip_set(1, 255, 255, 255);
@@ -425,61 +631,24 @@ static void run_diagnostics(void) {
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 5.3: chain=3 */
     announce(1, 0, 1, 3);
-    LOG_INF("T5.3: chain=3, all WHITE");
+    LOG_INF("T6.3: chain=3, all WHITE");
     strip_fill(255, 255, 255);
     rc = strip_send_n(3);
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 5.4: chain=8 */
     announce(1, 0, 1, 4);
-    LOG_INF("T5.4: chain=8, all WHITE");
+    LOG_INF("T6.4: chain=8, all WHITE");
     strip_fill(255, 255, 255);
     rc = strip_send_n(8);
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
-    /* Test 5.5: Rapid toggle — tests timing/latching */
     announce(1, 0, 1, 5);
-    LOG_INF("T5.5: Rapid toggle white/off x10");
-    for (int i = 0; i < 10; i++) {
-        strip_fill(255, 255, 255);
-        strip_send();
-        k_msleep(200);
-        strip_fill(0, 0, 0);
-        strip_send();
-        k_msleep(200);
-    }
-
-    /* ================================================================
-     * GROUP 6: COLOR MAPPING (onboard = CYAN)
-     * We label what we SEND via API. You report what you SEE.
-     * If colors appear wrong, the GRB mapping in the overlay is off.
-     * ================================================================ */
-
-    /* Test 6.1: API R=255 — should appear RED */
-    announce(0, 1, 1, 1);
-    LOG_INF("T6.1: Sending R=255,G=0,B=0 — expect RED");
-    strip_fill(255, 0, 0);
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 6.2: API G=255 — should appear GREEN */
-    announce(0, 1, 1, 2);
-    LOG_INF("T6.2: Sending R=0,G=255,B=0 — expect GREEN");
-    strip_fill(0, 255, 0);
-    rc = strip_send();
-    LOG_INF("  rc=%d", rc);
-    k_msleep(TEST_HOLD_MS);
-
-    /* Test 6.3: API B=255 — should appear BLUE */
-    announce(0, 1, 1, 3);
-    LOG_INF("T6.3: Sending R=0,G=0,B=255 — expect BLUE");
-    strip_fill(0, 0, 255);
-    rc = strip_send();
+    LOG_INF("T6.5: chain=13 (full), all WHITE");
+    strip_fill(255, 255, 255);
+    rc = strip_send_n(13);
     LOG_INF("  rc=%d", rc);
     k_msleep(TEST_HOLD_MS);
 
@@ -505,20 +674,26 @@ static void run_diagnostics(void) {
 
 static int led_driver_init(void) {
     onboard_init();
+    init_pin_table();
 
-    /* Announce boot: solid YELLOW 1.5s */
     onboard_set(1, 1, 0);
-    LOG_INF("╔══════════════════════════════════╗");
-    LOG_INF("║  LED DIAGNOSTIC MODE — STARTING  ║");
-    LOG_INF("╚══════════════════════════════════╝");
+    LOG_INF("╔═════════════════════════════════════════════╗");
+    LOG_INF("║  LED DIAGNOSTIC — SPI + PIN IDENTITY v2    ║");
+    LOG_INF("║  Groups: PinID / RawSPI / RawWS2812 /      ║");
+    LOG_INF("║          Driver / Patterns / ChainLen       ║");
+    LOG_INF("╚═════════════════════════════════════════════╝");
     k_msleep(1500);
     onboard_off();
 
     /* Get the strip device */
     strip = DEVICE_DT_GET(DT_NODELABEL(led_strip));
+    LOG_INF("Strip device: name='%s', ready=%s",
+            strip ? strip->name : "(null)",
+            device_is_ready(strip) ? "YES" : "NO");
+
     if (!device_is_ready(strip)) {
         LOG_ERR("LED strip device NOT READY — looping red blink forever");
-        LOG_ERR("This means the I2S or WS2812 driver failed to init.");
+        LOG_ERR("Check: CONFIG_SPI=y, CONFIG_LED_STRIP=y, CONFIG_WS2812_STRIP=y");
         while (1) {
             onboard_blink(1, 0, 0, 3, 150);
             k_msleep(500);
@@ -526,22 +701,28 @@ static int led_driver_init(void) {
         return -ENODEV;
     }
 
-    LOG_INF("Strip device ready: name='%s'", strip->name);
-    LOG_INF("Total LEDs configured: %d", TOTAL_LEDS);
-
-    /* Check I2S device too */
-#if DT_NODE_EXISTS(DT_NODELABEL(i2s_led))
+    /* Log DT status */
+#if DT_NODE_EXISTS(DT_NODELABEL(spi3))
     {
-        const struct device *i2s_dev = DEVICE_DT_GET(DT_NODELABEL(i2s_led));
-        LOG_INF("I2S device ready: %s (name='%s')",
-                device_is_ready(i2s_dev) ? "YES" : "NO",
-                i2s_dev ? i2s_dev->name : "(null)");
+        const struct device *s = DEVICE_DT_GET(DT_NODELABEL(spi3));
+        LOG_INF("SPI3: name='%s', ready=%s",
+                s->name, device_is_ready(s) ? "YES" : "NO");
     }
 #else
-    LOG_ERR("DT node 'i2s_led' does not exist!");
+    LOG_ERR("DT node 'spi3': MISSING");
 #endif
 
-    /* Solid GREEN 1s = all good, entering test loop */
+#if DT_NODE_EXISTS(DT_NODELABEL(spi2))
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(spi2), okay)
+    LOG_WRN("SPI2 is ENABLED — may conflict with SPI3 on shared pins!");
+#else
+    LOG_INF("SPI2: disabled (good — not conflicting)");
+#endif
+#endif
+
+    LOG_INF("led_strip DT node: EXISTS=%d",
+            DT_NODE_EXISTS(DT_NODELABEL(led_strip)));
+
     onboard_set(0, 1, 0);
     k_msleep(1000);
     onboard_off();

@@ -1,48 +1,59 @@
 #include <dt-bindings/led/led.h>
 
 /*
- * WS2812B LED strip via I2S on the Seeed XIAO nRF52840.
+ * WS2812B LED strip via SPI on the Seeed XIAO nRF52840.
  *
- * I2S pin assignments (D8/D9/D10 are the SPI header, repurposed):
- *   SDOUT = P1.14 (D9)  — data line to WS2812B strip
- *   SCK   = P1.13 (D8)  — I2S bit clock (unused, leave unconnected)
- *   LRCK  = P1.15 (D10) — I2S word clock (unused, leave unconnected)
+ * Matches the exact pattern used by corne/nice_nano and every other
+ * working ZMK keyboard with WS2812 LEDs.
  *
- * The board's default pinctrl claims P1.13/P1.14/P1.15 for SPI2,
- * so we disable SPI2 to free those pins.
+ * Data pin: D9 = P1.14 (SPIM_MOSI on SPI3)
+ *
+ * The board's default pinctrl claims P1.14 as SPIM_MISO on SPI2,
+ * so we disable SPI2 to free the pin.
  */
 
-/* Disable SPI2 which claims P1.13/P1.14/P1.15 in the board's default pinctrl. */
+/* Disable SPI2 which claims P1.14 in the board's default pinctrl. */
 &spi2 {
     status = "disabled";
 };
 
 &pinctrl {
-    i2s0_default: i2s0_default {
+    spi3_default: spi3_default {
         group1 {
-            psels = <NRF_PSEL(I2S_SCK_M, 1, 13)>,   /* D8  — unused clock */
-                    <NRF_PSEL(I2S_LRCK_M, 1, 15)>,   /* D10 — unused clock */
-                    <NRF_PSEL(I2S_SDOUT, 1, 14)>;     /* D9  — data to LEDs */
+            psels = <NRF_PSEL(SPIM_MOSI, 1, 14)>;
+        };
+    };
+
+    spi3_sleep: spi3_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_MOSI, 1, 14)>;
+            low-power-enable;
         };
     };
 };
 
-i2s_led: &i2s0 {
+&spi3 {
+    compatible = "nordic,nrf-spim";
     status = "okay";
-    pinctrl-0 = <&i2s0_default>;
-    pinctrl-names = "default";
-};
 
-/ {
-    led_strip: ws2812 {
-        compatible = "worldsemi,ws2812-i2s";
+    pinctrl-0 = <&spi3_default>;
+    pinctrl-1 = <&spi3_sleep>;
+    pinctrl-names = "default", "sleep";
 
-        i2s-dev = <&i2s_led>;
+    led_strip: ws2812@0 {
+        compatible = "worldsemi,ws2812-spi";
+
+        /* SPI */
+        reg = <0>; /* ignored, but necessary for SPI bindings */
+        spi-max-frequency = <4000000>;
+
+        /* WS2812 */
         chain-length = <13>; /* 8 key LEDs + 5 battery LEDs */
+        spi-one-frame = <0x70>;
+        spi-zero-frame = <0x40>;
+
         color-mapping = <LED_COLOR_ID_GREEN
                          LED_COLOR_ID_RED
                          LED_COLOR_ID_BLUE>;
-        out-active-low;       /* nRF52 I2S SDOUT idles high — invert for WS2812 */
-        reset-delay = <120>;  /* 120 us reset/latch delay (WS2812B needs >= 50 us) */
     };
 };
