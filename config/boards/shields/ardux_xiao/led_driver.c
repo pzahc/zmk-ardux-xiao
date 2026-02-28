@@ -23,6 +23,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 
 #include <zmk/event_manager.h>
@@ -355,11 +356,33 @@ ZMK_SUBSCRIPTION(led_driver_usb, zmk_usb_conn_state_changed);
  * Initialization
  * ============================================================ */
 
+/*
+ * Debug: blink the XIAO's onboard LED to show init status.
+ * XIAO nRF52840 onboard LEDs are active-low (common anode).
+ *   Red   = P0.26
+ *   Green = P0.30
+ *   Blue  = P0.06
+ */
+#define DEBUG_LED_NODE(port, pin) \
+    DEVICE_DT_GET(DT_NODELABEL(gpio##port)), pin
+
+static void debug_blink(const struct device *gpio_dev, gpio_pin_t pin, int count, int ms) {
+    gpio_pin_configure(gpio_dev, pin, GPIO_OUTPUT_INACTIVE);
+    for (int i = 0; i < count; i++) {
+        gpio_pin_set(gpio_dev, pin, 0); /* active-low: 0 = ON */
+        k_msleep(ms);
+        gpio_pin_set(gpio_dev, pin, 1); /* 1 = OFF */
+        k_msleep(ms);
+    }
+}
+
 static int led_driver_init(void) {
     strip = DEVICE_DT_GET(DT_NODELABEL(led_strip));
     if (!device_is_ready(strip)) {
         LOG_ERR("LED strip device not ready");
         strip = NULL;
+        /* Blink RED 5 times = strip device not ready */
+        debug_blink(DEVICE_DT_GET(DT_NODELABEL(gpio0)), 26, 5, 200);
         return -ENODEV;
     }
 
@@ -372,6 +395,9 @@ static int led_driver_init(void) {
 
     update_blink_timer();
     refresh_strip();
+
+    /* Blink GREEN 3 times = init success, strip data sent */
+    debug_blink(DEVICE_DT_GET(DT_NODELABEL(gpio0)), 30, 3, 200);
     return 0;
 }
 
