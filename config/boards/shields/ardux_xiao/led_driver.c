@@ -393,11 +393,26 @@ static int led_driver_init(void) {
     LOG_INF("LED driver initialized (%d key LEDs + %d battery LEDs = %d total)",
             NUM_KEY_LEDS, BATTERY_LED_COUNT, TOTAL_LEDS);
 
+    /* DEBUG: Force all LEDs to bright white to test strip communication */
+    for (int i = 0; i < TOTAL_LEDS; i++) {
+        pixels[i].r = 255;
+        pixels[i].g = 255;
+        pixels[i].b = 255;
+    }
+    int rc = led_strip_update_rgb(strip, pixels, TOTAL_LEDS);
+    if (rc) {
+        /* Blink RED 10 times = led_strip_update_rgb failed */
+        debug_blink(DEVICE_DT_GET(DT_NODELABEL(gpio0)), 26, 10, 100);
+    } else {
+        /* Blink GREEN 3 times = data sent successfully */
+        debug_blink(DEVICE_DT_GET(DT_NODELABEL(gpio0)), 30, 3, 200);
+    }
+
+    /* Leave LEDs white for 5 seconds so you can see them, then resume normal */
+    k_msleep(5000);
+
     update_blink_timer();
     refresh_strip();
-
-    /* Blink GREEN 3 times = init success, strip data sent */
-    debug_blink(DEVICE_DT_GET(DT_NODELABEL(gpio0)), 30, 3, 200);
     return 0;
 }
 
