@@ -393,7 +393,7 @@ static int led_driver_init(void) {
     LOG_INF("LED driver initialized (%d key LEDs + %d battery LEDs = %d total)",
             NUM_KEY_LEDS, BATTERY_LED_COUNT, TOTAL_LEDS);
 
-    /* DEBUG: Force all LEDs to bright white to test strip communication */
+    /* DEBUG: Force all LEDs to bright white to test I2S strip communication */
     for (int i = 0; i < TOTAL_LEDS; i++) {
         pixels[i].r = 255;
         pixels[i].g = 255;
