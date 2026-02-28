@@ -3,4 +3,9 @@ if SHIELD_ARDUX_XIAO_LEFT || SHIELD_ARDUX_XIAO_RIGHT
 config ZMK_KEYBOARD_NAME
 	default "ARDUX XIAO"
 
+config ARDUX_XIAO_PER_KEY_LED
+	bool "Per-key LED support for ARDUX XIAO"
+	default y
+	depends on WS2812_STRIP
+
 endif

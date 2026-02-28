@@ -47,7 +47,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 /* Number of battery indicator LEDs (chained after key LEDs).
  * Set to 1 for a single status LED, or more for proportional bar.
  * Works for any value >= 1. */
-#define BATTERY_LED_COUNT 4
+#define BATTERY_LED_COUNT 5
 
 /* Total LEDs on the strip */
 #define TOTAL_LEDS (NUM_KEY_LEDS + BATTERY_LED_COUNT)

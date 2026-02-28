@@ -1,4 +1,0 @@
-config ARDUX_XIAO_PER_KEY_LED
-	bool "Per-key LED support for ARDUX XIAO"
-	default y
-	depends on WS2812_STRIP
