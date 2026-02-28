@@ -42,6 +42,7 @@ i2s_led: &i2s0 {
         color-mapping = <LED_COLOR_ID_GREEN
                          LED_COLOR_ID_RED
                          LED_COLOR_ID_BLUE>;
+        out-active-low;       /* nRF52 I2S SDOUT idles high — invert for WS2812 */
         reset-delay = <120>;  /* 120 us reset/latch delay (WS2812B needs >= 50 us) */
     };
 };
