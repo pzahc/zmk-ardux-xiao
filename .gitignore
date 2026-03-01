@@ -1,1 +1,19 @@
+# ZMK Build Artifacts
+build/
 .build/
+
+# West Workspace
+.west/
+modules/
+zephyr/
+zmk/
+
+# Local Environment (mise/uv)
+.venv/
+.python-version
+mise.toml
+pyproject.toml
+uv.lock
+
+# macOS
+.DS_Store

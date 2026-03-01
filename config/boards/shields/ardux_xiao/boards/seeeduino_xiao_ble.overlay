@@ -17,16 +17,34 @@
     status = "disabled";
 };
 
+/ {
+    chosen {
+        zephyr,console = &cdc_acm_uart0;
+        zephyr,shell-uart = &cdc_acm_uart0;
+    };
+};
+
+&zephyr_udc0 {
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
+    };
+};
+
 &pinctrl {
     spi3_default: spi3_default {
         group1 {
-            psels = <NRF_PSEL(SPIM_MOSI, 1, 14)>;
+            psels = <NRF_PSEL(SPIM_SCK, 1, 13)
+                     NRF_PSEL(SPIM_MOSI, 1, 15)
+                     NRF_PSEL(SPIM_MISO, 1, 14)>;
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
 
     spi3_sleep: spi3_sleep {
         group1 {
-            psels = <NRF_PSEL(SPIM_MOSI, 1, 14)>;
+            psels = <NRF_PSEL(SPIM_SCK, 1, 13)
+                     NRF_PSEL(SPIM_MOSI, 1, 15)
+                     NRF_PSEL(SPIM_MISO, 1, 14)>;
             low-power-enable;
         };
     };
@@ -47,10 +65,10 @@
         reg = <0>; /* ignored, but necessary for SPI bindings */
         spi-max-frequency = <4000000>;
 
-        /* WS2812 */
+        /* WS2812 - 4MHz timing for 3.3V compatibility */
         chain-length = <13>; /* 8 key LEDs + 5 battery LEDs */
         spi-one-frame = <0x70>;
-        spi-zero-frame = <0x40>;
+        spi-zero-frame = <0x60>;
 
         color-mapping = <LED_COLOR_ID_GREEN
                          LED_COLOR_ID_RED
