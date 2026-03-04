@@ -1,12 +1,14 @@
 #include <dt-bindings/led/led.h>
+#include <dt-bindings/gpio/gpio.h>
 
 /*
  * WS2812B LED strip via SPI on the Seeed XIAO nRF52840.
  *
- * Matches the exact pattern used by corne/nice_nano and every other
- * working ZMK keyboard with WS2812 LEDs.
- *
  * Data pin: D10 = P1.15 (SPIM_MOSI on SPI3)
+ * Wake LED: D9  = P1.14 (GPIO, active-high)
+ *
+ * SPI3 uses SCK (P1.13) and MOSI (P1.15) only.
+ * D9/MISO freed for the wake/sleep indicator LED.
  *
  * The board's default pinctrl claims P1.13-P1.15 on SPI2,
  * so we disable SPI2 to free the pins.
@@ -39,8 +41,7 @@
     spi3_default: spi3_default {
         group1 {
             psels = <NRF_PSEL(SPIM_SCK, 1, 13)
-                     NRF_PSEL(SPIM_MOSI, 1, 15)
-                     NRF_PSEL(SPIM_MISO, 1, 14)>;
+                     NRF_PSEL(SPIM_MOSI, 1, 15)>;
             nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
@@ -48,8 +49,7 @@
     spi3_sleep: spi3_sleep {
         group1 {
             psels = <NRF_PSEL(SPIM_SCK, 1, 13)
-                     NRF_PSEL(SPIM_MOSI, 1, 15)
-                     NRF_PSEL(SPIM_MISO, 1, 14)>;
+                     NRF_PSEL(SPIM_MOSI, 1, 15)>;
             low-power-enable;
         };
     };
@@ -75,12 +75,23 @@
          * 0x40 = 0100 0000 → T0H = 250ns (WS2812B needs ≤380ns)
          * Previous 0x60 gave T0H=500ns which exceeds the threshold,
          * causing all bits to be read as 1 → white on all LEDs. */
-        chain-length = <13>; /* 5 battery LEDs + 8 key LEDs */
+        chain-length = <11>; /* 3 battery LEDs + 8 key LEDs */
         spi-one-frame = <0x70>;
         spi-zero-frame = <0x40>;
 
         color-mapping = <LED_COLOR_ID_GREEN
                          LED_COLOR_ID_RED
                          LED_COLOR_ID_BLUE>;
+    };
+};
+
+/* Wake/sleep indicator LED on D9 = P1.14 (freed from SPI3 MISO) */
+/ {
+    leds {
+        compatible = "gpio-leds";
+        wake_led: wake_led {
+            gpios = <&gpio1 14 GPIO_ACTIVE_HIGH>;
+            label = "Wake LED";
+        };
     };
 };

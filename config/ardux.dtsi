@@ -294,6 +294,13 @@
 
 		combo_z         { layers = <LAYER_ID_BASE>; timeout-ms = <TIMEOUT_COMBO_4>; key-positions = <KEY_A KEY_R KEY_T KEY_S>; bindings = <&kp Z>; };
 		combo_caps_lock { layers = <LAYER_ID_BASE>; timeout-ms = <TIMEOUT_COMBO_4>; key-positions = <KEY_O KEY_I KEY_Y KEY_A>; bindings = <&kp CAPS>; };
+
+		/*****************************************
+		 * BT layer only: bootloader & sys_reset
+		 * Require 2-key combos to prevent accidental trigger
+		 *****************************************/
+		combo_bootloader { layers = <LAYER_ID_BT_SEL>; timeout-ms = <TIMEOUT_COMBO_2>; key-positions = <KEY_I KEY_O>; bindings = <&bootloader>; };
+		combo_sys_reset  { layers = <LAYER_ID_BT_SEL>; timeout-ms = <TIMEOUT_COMBO_2>; key-positions = <KEY_Y KEY_I>; bindings = <&sys_reset>; };
 	};
 };
 
@@ -608,7 +615,7 @@
 				LEADING_NONES
 				ARDUX_BT_TOP    &bt BT_SEL 2 &bt BT_SEL 1 &bt BT_SEL 0
 				MIDDLE_NONES
-				ARDUX_BT_BOTTOM &bt BT_SEL 5 &bt BT_SEL 4 &bt BT_SEL 3
+				ARDUX_BT_BOTTOM &bt BT_SEL 5  &bt BT_SEL 4  &bt BT_SEL 3
 				TRAILING_NONES
 			>;
 		};

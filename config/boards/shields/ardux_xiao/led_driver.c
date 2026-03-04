@@ -1,45 +1,49 @@
 /*
  * LED driver for ARDUX XIAO
  *
- * Drives a single WS2812B strip with two zones:
+ * Drives a single WS2812B strip with two zones, plus a separate
+ * GPIO wake/sleep indicator LED on D9 (P1.14).
  *
  * Zone 1: Battery indicator LEDs (indices 0 to BATTERY_LED_COUNT-1)
- *   - Gradient from magenta (empty) to cyan (full)
- *   - Proportional fill: active LEDs are bright, inactive are very dim
- *   - Red-only blink when critically low (<10%)
- *   - Slow pulse when charging (cool white)
+ *   - Single color (cyan), fill level = charge level
+ *   - Unlit LEDs are OFF
+ *   - Red blink when critically low (<10%)
+ *   - Gentle pulse when charging on USB
  *
  * Zone 2: Per-key LEDs (indices BATTERY_LED_COUNT to TOTAL_LEDS-1)
  *   - Color reflects the active ARDUX layer
  *   - Brightens on keypress, dims on release
  *
- * All strip updates are funneled through a single work queue item
- * to prevent race conditions from ARDUX's rapid combo events.
+ * Brightness is reduced when running on battery (vs USB).
+ * On sleep: strip is blanked, wake LED turns off.
+ * On wake: strip resumes, wake LED turns on.
  *
  * Physical LED order on strip (left hand):
- *   LED 0-4:  Battery indicator
- *   LED 5:    A key (position 3)
- *   LED 6:    R key (position 2)
- *   LED 7:    T key (position 1)
- *   LED 8:    S key (position 0)
- *   LED 9:    O key (position 4)
- *   LED 10:   I key (position 5)
- *   LED 11:   Y key (position 6)
- *   LED 12:   E key (position 7)
+ *   LED 0-2:  Battery indicator
+ *   LED 3:    A key (position 3)
+ *   LED 4:    R key (position 2)
+ *   LED 5:    T key (position 1)
+ *   LED 6:    S key (position 0)
+ *   LED 7:    O key (position 4)
+ *   LED 8:    I key (position 5)
+ *   LED 9:    Y key (position 6)
+ *   LED 10:   E key (position 7)
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
-#include <zmk/events/battery_state_changed.h>
-#include <zmk/events/usb_conn_state_changed.h>
+#include <hal/nrf_power.h>
+#include <zmk/events/activity_state_changed.h>
 #include <zmk/event_manager.h>
 #include <zmk/keymap.h>
 #include <zmk/battery.h>
 #include <zmk/usb.h>
+#include <zmk/activity.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(led_driver, 4);
@@ -57,13 +61,16 @@ LOG_MODULE_REGISTER(led_driver, 4);
 
 #define TOTAL_LEDS (BATTERY_LED_COUNT + NUM_KEY_LEDS)
 
-/* Battery LED brightness (0-255) */
-#define BATTERY_ACTIVE_BRIGHTNESS  35
-#define BATTERY_INACTIVE_BRIGHTNESS 4
-#define BATTERY_BLINK_BRIGHTNESS   60
+/* Battery LED brightness (0-255).
+ * These are passed to scale_rgb() which multiplies the base color
+ * channel (0-255) by this value / 255.  So brightness 30 with a
+ * channel value of 200 gives (200*30)/255 ≈ 24. */
+#define BATTERY_BRIGHTNESS        30
+#define BATTERY_CHARGE_BRIGHTNESS 40
+#define BATTERY_CRIT_BRIGHTNESS   40
 
-/* Blink intervals (ms) */
-#define BLINK_CHARGE_MS   1500
+/* Blink / pulse intervals (ms) */
+#define PULSE_CHARGE_MS   2000
 #define BLINK_CRITICAL_MS  400
 
 /* Battery threshold */
@@ -71,6 +78,16 @@ LOG_MODULE_REGISTER(led_driver, 4);
 
 /* Keypress brightness boost */
 #define PRESS_BOOST 90
+
+/* Brightness scale when on battery vs USB (percentage, 0-100).
+ * NOTE: Currently the strip VCC is on the 5V pin (USB only),
+ * so the strip has no power on battery. This scaling is here
+ * for when the strip VCC is rewired to 3V3 or VBAT. */
+#define BATTERY_BRIGHTNESS_PCT 50
+
+/* Periodic refresh interval (ms). ~16 FPS — gentle on resources,
+ * fast enough for responsive key lighting. */
+#define REFRESH_INTERVAL_MS 60
 
 /* ============================================================
  * Key-to-LED mapping
@@ -120,21 +137,14 @@ static const struct led_rgb layer_colors[NUM_LAYER_COLORS] = {
 };
 
 /* ============================================================
- * Battery gradient colors
+ * Battery LED color — single color, fill-level indicates charge
  * ============================================================ */
 
-static const struct led_rgb BAT_COLOR_EMPTY  = { .r = 255, .g =   0, .b = 200 };
-static const struct led_rgb BAT_COLOR_FULL   = { .r =   0, .g = 255, .b = 220 };
-static const struct led_rgb BAT_COLOR_CRIT   = { .r = 255, .g =   0, .b =   0 };
-static const struct led_rgb BAT_COLOR_CHARGE = { .r = 140, .g = 220, .b = 255 };
+static const struct led_rgb BAT_COLOR      = { .r =   0, .g = 180, .b = 200 }; /* cyan */
+static const struct led_rgb BAT_COLOR_CRIT = { .r = 255, .g =   0, .b =   0 }; /* red */
 
 /* ============================================================
  * State
- *
- * All state is updated atomically from event handlers.
- * The actual pixel computation and SPI transfer happens
- * only in refresh_work_handler on the system work queue,
- * which is single-threaded — no races possible.
  * ============================================================ */
 
 static struct led_rgb pixels[TOTAL_LEDS];
@@ -143,24 +153,20 @@ static const struct device *strip;
 
 static uint8_t battery_level = 100;
 static bool usb_powered = false;
-static bool blink_on = true;
+static bool is_sleeping = false;
 
-/* Periodic refresh timer.
- * Instead of refreshing on every event (which causes flickering
- * because ARDUX combos rapidly activate/deactivate layers),
- * we refresh at a fixed rate. By the time the timer fires,
- * combo processing has settled and layer state is stable. */
+/* Wake/sleep indicator LED on D9 */
+static const struct gpio_dt_spec wake_led =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(wake_led), gpios);
+
+/* Periodic refresh */
 static void refresh_work_handler(struct k_work *work);
 K_WORK_DEFINE(refresh_work, refresh_work_handler);
 
 static void refresh_timer_handler(struct k_timer *timer);
 K_TIMER_DEFINE(refresh_timer, refresh_timer_handler, NULL);
 
-/* How often to refresh the strip (ms). 33ms ≈ 30 FPS. */
-#define REFRESH_INTERVAL_MS 33
-
-/* Blink state counter — toggled by refresh cycle, not a separate timer.
- * Counts refresh ticks to derive blink timing. */
+/* Blink tick counter */
 static uint16_t blink_tick = 0;
 
 /* ============================================================
@@ -180,27 +186,20 @@ static inline struct led_rgb scale_rgb(struct led_rgb c, uint8_t brightness) {
     };
 }
 
-static inline struct led_rgb lerp_rgb(struct led_rgb a, struct led_rgb b, uint8_t t) {
+/* Apply global brightness reduction when on battery */
+static inline struct led_rgb apply_power_scale(struct led_rgb c) {
+    if (usb_powered) {
+        return c;
+    }
     return (struct led_rgb){
-        .r = (uint8_t)(((uint16_t)a.r * (255 - t) + (uint16_t)b.r * t) / 255),
-        .g = (uint8_t)(((uint16_t)a.g * (255 - t) + (uint16_t)b.g * t) / 255),
-        .b = (uint8_t)(((uint16_t)a.b * (255 - t) + (uint16_t)b.b * t) / 255),
+        .r = (uint8_t)(((uint16_t)c.r * BATTERY_BRIGHTNESS_PCT) / 100),
+        .g = (uint8_t)(((uint16_t)c.g * BATTERY_BRIGHTNESS_PCT) / 100),
+        .b = (uint8_t)(((uint16_t)c.b * BATTERY_BRIGHTNESS_PCT) / 100),
     };
 }
 
-static struct led_rgb battery_gradient_color(int led_index) {
-    if (BATTERY_LED_COUNT <= 1) {
-        return lerp_rgb(BAT_COLOR_EMPTY, BAT_COLOR_FULL,
-                        (uint8_t)((battery_level * 255) / 100));
-    }
-    uint8_t t = (uint8_t)(((uint16_t)led_index * 255) / (BATTERY_LED_COUNT - 1));
-    return lerp_rgb(BAT_COLOR_EMPTY, BAT_COLOR_FULL, t);
-}
-
 /* ============================================================
- * Refresh work handler — ONLY place pixels are computed
- * and SPI transfer happens. Runs on system work queue
- * (single-threaded, so no concurrent access).
+ * Refresh work handler
  * ============================================================ */
 
 static void refresh_work_handler(struct k_work *work) {
@@ -208,22 +207,34 @@ static void refresh_work_handler(struct k_work *work) {
         return;
     }
 
-    /* --- Blink state (derived from tick counter) --- */
-
-    blink_tick++;
-    uint16_t charge_ticks = BLINK_CHARGE_MS / REFRESH_INTERVAL_MS;
-    uint16_t critical_ticks = BLINK_CRITICAL_MS / REFRESH_INTERVAL_MS;
-    bool is_critical = (!usb_powered && battery_level <= BATTERY_CRITICAL);
-
-    if (usb_powered) {
-        blink_on = (blink_tick % (charge_ticks * 2)) < charge_ticks;
-    } else if (is_critical) {
-        blink_on = (blink_tick % (critical_ticks * 2)) < critical_ticks;
-    } else {
-        blink_on = true;
+    /* If sleeping, blank the strip and stop */
+    if (is_sleeping) {
+        memset(pixels, 0, sizeof(pixels));
+        led_strip_update_rgb(strip, pixels, TOTAL_LEDS);
+        return;
     }
 
-    /* --- Zone 1: Battery LEDs --- */
+    /* --- Poll USB and battery state --- */
+
+    /* Read VBUS detect directly from nRF52840 POWER register —
+     * ZMK's zmk_usb_get_status() was returning USB_DC_UNKNOWN
+     * even when USB is clearly connected (CDC ACM works). */
+    usb_powered = nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+    battery_level = zmk_battery_state_of_charge();
+
+    /* --- Tick counter for blink/pulse --- */
+
+    blink_tick++;
+
+    /* --- Zone 1: Battery LEDs ---
+     *
+     * Simple scheme:
+     *   - One color (cyan), fill level = number of lit LEDs
+     *   - Charging on USB: gentle pulse (brightness ramps up/down)
+     *   - Critical (<10%): red blink
+     *   - Otherwise: steady cyan, lit LEDs = charge level
+     *   - Unlit LEDs are OFF (no ghost)
+     */
 
     int leds_active;
     if (BATTERY_LED_COUNT == 1) {
@@ -235,29 +246,41 @@ static void refresh_work_handler(struct k_work *work) {
         }
     }
 
-    bool should_blink = usb_powered || is_critical;
-    bool show = !should_blink || blink_on;
+    bool is_critical = (battery_level <= BATTERY_CRITICAL);
 
     for (int i = 0; i < BATTERY_LED_COUNT; i++) {
-        struct led_rgb color;
-        uint8_t brightness;
-
         if (usb_powered) {
-            color = BAT_COLOR_CHARGE;
-            brightness = (i < leds_active)
-                ? (show ? BATTERY_BLINK_BRIGHTNESS : BATTERY_INACTIVE_BRIGHTNESS)
-                : BATTERY_INACTIVE_BRIGHTNESS;
+            /* On USB: always show red pulse, all active LEDs */
+            if (i < leds_active) {
+                uint16_t pulse_ticks = PULSE_CHARGE_MS / REFRESH_INTERVAL_MS;
+                uint16_t pos = blink_tick % pulse_ticks;
+                uint16_t half = pulse_ticks / 2;
+                uint8_t bright = (pos < half)
+                    ? (uint8_t)(BATTERY_CHARGE_BRIGHTNESS * pos / half)
+                    : (uint8_t)(BATTERY_CHARGE_BRIGHTNESS * (pulse_ticks - pos) / half);
+                if (bright < 10) bright = 10;
+                pixels[i] = scale_rgb(BAT_COLOR_CRIT, bright);
+            } else {
+                pixels[i] = (struct led_rgb){0, 0, 0};
+            }
         } else if (is_critical) {
-            color = BAT_COLOR_CRIT;
-            brightness = show ? BATTERY_BLINK_BRIGHTNESS : 0;
+            /* On battery, critical (<10%): red blink all LEDs */
+            uint16_t crit_ticks = BLINK_CRITICAL_MS / REFRESH_INTERVAL_MS;
+            bool blink_on = (blink_tick % (crit_ticks * 2)) < crit_ticks;
+            pixels[i] = blink_on
+                ? scale_rgb(BAT_COLOR_CRIT, BATTERY_CRIT_BRIGHTNESS)
+                : (struct led_rgb){0, 0, 0};
+        } else if (battery_level < 50) {
+            /* On battery, low (10-49%): steady red fill */
+            if (i < leds_active) {
+                pixels[i] = scale_rgb(BAT_COLOR_CRIT, BATTERY_BRIGHTNESS);
+            } else {
+                pixels[i] = (struct led_rgb){0, 0, 0};
+            }
         } else {
-            color = battery_gradient_color(i);
-            brightness = (i < leds_active)
-                ? BATTERY_ACTIVE_BRIGHTNESS
-                : BATTERY_INACTIVE_BRIGHTNESS;
+            /* On battery, 50%+: off */
+            pixels[i] = (struct led_rgb){0, 0, 0};
         }
-
-        pixels[i] = scale_rgb(color, brightness);
     }
 
     /* --- Zone 2: Per-key LEDs --- */
@@ -271,13 +294,15 @@ static void refresh_work_handler(struct k_work *work) {
 
     for (int i = 0; i < NUM_KEYS; i++) {
         uint8_t led_idx = key_to_led[i];
+        struct led_rgb c;
         if (key_pressed[i]) {
-            pixels[led_idx].r = clamp_add(base.r, PRESS_BOOST);
-            pixels[led_idx].g = clamp_add(base.g, PRESS_BOOST);
-            pixels[led_idx].b = clamp_add(base.b, PRESS_BOOST);
+            c.r = clamp_add(base.r, PRESS_BOOST);
+            c.g = clamp_add(base.g, PRESS_BOOST);
+            c.b = clamp_add(base.b, PRESS_BOOST);
         } else {
-            pixels[led_idx] = base;
+            c = base;
         }
+        pixels[led_idx] = apply_power_scale(c);
     }
 
     /* Push to hardware */
@@ -294,9 +319,6 @@ static void refresh_timer_handler(struct k_timer *timer) {
 
 /* ============================================================
  * ZMK Event Handlers
- *
- * These only update state and schedule a refresh.
- * The actual pixel work happens in the work queue handler.
  * ============================================================ */
 
 static int on_position_state_changed(const zmk_event_t *eh) {
@@ -308,23 +330,38 @@ static int on_position_state_changed(const zmk_event_t *eh) {
 }
 
 static int on_layer_state_changed(const zmk_event_t *eh) {
-    /* Layer state is read fresh in the refresh handler via
-     * zmk_keymap_highest_layer_active(), so nothing to do here. */
     return 0;
 }
 
-static int on_battery_state_changed(const zmk_event_t *eh) {
-    struct zmk_battery_state_changed *ev = as_zmk_battery_state_changed(eh);
-    if (ev) {
-        battery_level = ev->state_of_charge;
-    }
-    return 0;
-}
+/* Battery and USB state are polled in refresh_work_handler —
+ * event-driven updates were unreliable. */
 
-static int on_usb_conn_state_changed(const zmk_event_t *eh) {
-    struct zmk_usb_conn_state_changed *ev = as_zmk_usb_conn_state_changed(eh);
+static int on_activity_state_changed(const zmk_event_t *eh) {
+    struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
     if (ev) {
-        usb_powered = (ev->conn_state != ZMK_USB_CONN_NONE);
+        bool was_sleeping = is_sleeping;
+        is_sleeping = (ev->state == ZMK_ACTIVITY_SLEEP);
+
+        /* Update wake LED */
+        if (device_is_ready(wake_led.port)) {
+            gpio_pin_set_dt(&wake_led, !is_sleeping);
+        }
+
+        if (is_sleeping && !was_sleeping) {
+            /* Entering sleep: stop the timer first, then blank the strip
+             * SYNCHRONOUSLY.  k_work_submit() is too late — the MCU
+             * enters deep sleep before the system work queue runs. */
+            k_timer_stop(&refresh_timer);
+            memset(pixels, 0, sizeof(pixels));
+            led_strip_update_rgb(strip, pixels, TOTAL_LEDS);
+            LOG_INF("LED driver: sleep (strip blanked sync)");
+        } else if (!is_sleeping && was_sleeping) {
+            /* Waking up: restart the periodic refresh */
+            k_timer_start(&refresh_timer,
+                          K_MSEC(REFRESH_INTERVAL_MS),
+                          K_MSEC(REFRESH_INTERVAL_MS));
+            LOG_INF("LED driver: wake");
+        }
     }
     return 0;
 }
@@ -339,11 +376,10 @@ ZMK_SUBSCRIPTION(led_driver, zmk_position_state_changed);
 ZMK_LISTENER(led_driver_layer, on_layer_state_changed);
 ZMK_SUBSCRIPTION(led_driver_layer, zmk_layer_state_changed);
 
-ZMK_LISTENER(led_driver_battery, on_battery_state_changed);
-ZMK_SUBSCRIPTION(led_driver_battery, zmk_battery_state_changed);
+/* Battery and USB listeners removed — state is polled in refresh handler */
 
-ZMK_LISTENER(led_driver_usb, on_usb_conn_state_changed);
-ZMK_SUBSCRIPTION(led_driver_usb, zmk_usb_conn_state_changed);
+ZMK_LISTENER(led_driver_activity, on_activity_state_changed);
+ZMK_SUBSCRIPTION(led_driver_activity, zmk_activity_state_changed);
 
 /* ============================================================
  * Initialization
@@ -356,15 +392,21 @@ static int led_driver_init(void) {
         return -ENODEV;
     }
 
+    /* Initialize wake/sleep LED — ON at boot (board is awake) */
+    if (device_is_ready(wake_led.port)) {
+        gpio_pin_configure_dt(&wake_led, GPIO_OUTPUT_ACTIVE);
+        LOG_INF("Wake LED initialized on D9");
+    } else {
+        LOG_WRN("Wake LED GPIO not ready");
+    }
+
     battery_level = zmk_battery_state_of_charge();
     usb_powered = zmk_usb_is_powered();
 
-    /* Do the initial refresh synchronously (no contention at boot) */
+    /* Initial refresh (no contention at boot) */
     refresh_work_handler(NULL);
 
-    /* Start periodic refresh timer (~30 FPS).
-     * This decouples LED updates from the rapid event storm
-     * that ARDUX combos generate, preventing flicker. */
+    /* Start periodic refresh timer */
     k_timer_start(&refresh_timer,
                   K_MSEC(REFRESH_INTERVAL_MS),
                   K_MSEC(REFRESH_INTERVAL_MS));

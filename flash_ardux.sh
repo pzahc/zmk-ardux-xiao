@@ -48,11 +48,15 @@ echo "📂 Found mount point: $TARGET_VOL"
 
 # 4. Copy the File
 echo "💾 Copying firmware..."
-cp "$UF2_FILE" "$TARGET_VOL/"
+cp "$UF2_FILE" "$TARGET_VOL/" 2>/dev/null
 
-if [ $? -eq 0 ]; then
-  echo "🎉 Deployment complete! The XIAO will reboot now."
+# The bootloader reboots as soon as it receives the last UF2 block,
+# which often causes cp to report "Device not configured" (exit code 1).
+# This is normal and the flash still succeeds.  We check whether the
+# volume disappeared (device rebooted) as the real success indicator.
+sleep 2
+if [ ! -d "$TARGET_VOL" ]; then
+  echo "🎉 Deployment complete! The XIAO rebooted with new firmware."
 else
-  echo "❌ Copy failed. Check permissions or connection."
-  exit 1
+  echo "⚠️  Volume still mounted — flash may have succeeded. Check the device."
 fi
